@@ -392,9 +392,17 @@ impl BatchingEngine {
         {
             let is_exist = self.tasks.read().await.contains_key(&flow_id);
             match (create_if_not_exists, or_replace, is_exist) {
-                // if replace, ignore that old flow exists
+                // if replace, first properly cancel the old task before creating new one
                 (_, true, true) => {
                     info!("Replacing flow with id={}", flow_id);
+                    // Gracefully shut down the old task: send shutdown signal + abort handle.
+                    // This ensures the old task stops before the new one starts,
+                    // preventing two tasks from running concurrently on the same flow.
+                    if let Err(err) = self.remove_flow_inner(flow_id).await {
+                        warn!(
+                            "Failed to remove old flow {flow_id} during replace, proceeding anyway: {err}"
+                        );
+                    }
                 }
                 (false, false, true) => FlowAlreadyExistSnafu { id: flow_id }.fail()?,
                 // already exists, and not replace, return None
@@ -662,21 +670,37 @@ impl BatchingEngine {
     }
 
     pub async fn remove_flow_inner(&self, flow_id: FlowId) -> Result<(), Error> {
-        if self.tasks.write().await.remove(&flow_id).is_none() {
+        let task = self.tasks.write().await.remove(&flow_id);
+        if task.is_none() {
             warn!("Flow {flow_id} not found in tasks");
             FlowNotFoundSnafu { id: flow_id }.fail()?;
         }
+
         let Some(tx) = self.shutdown_txs.write().await.remove(&flow_id) else {
             UnexpectedSnafu {
                 reason: format!("Can't found shutdown tx for flow {flow_id}"),
             }
             .fail()?
         };
+
+        // Send graceful shutdown signal first, so the task loop can clean up
         if tx.send(()).is_err() {
             warn!(
                 "Fail to shutdown flow {flow_id} due to receiver already dropped, maybe flow {flow_id} is already dropped?"
             )
         }
+
+        // Abort the background tokio task handle to ensure it stops promptly.
+        // The shutdown signal above gives the task a chance to clean up gracefully,
+        // but if the task is stuck in a long-running query or sleep, we need abort()
+        // to force it to stop.
+        if let Some(task) = task {
+            let handle = task.state.write().unwrap().task_handle.take();
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+        }
+
         Ok(())
     }
 
@@ -754,5 +778,368 @@ impl FlowEngine for BatchingEngine {
         req: api::v1::flow::DirtyWindowRequests,
     ) -> Result<(), Error> {
         self.handle_mark_dirty_time_window(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use api::v1::greptime_request::Request;
+    use catalog::memory::new_memory_catalog_manager;
+    use common_error::ext::BoxedError;
+    use common_meta::key::TableMetadataManager;
+    use common_meta::key::flow::FlowMetadataManager;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_query::Output;
+    use query::options::QueryOptions;
+    use session::context::{QueryContext, QueryContextRef};
+
+    use super::*;
+    use crate::batching_mode::frontend_client::{
+        FrontendClient, GrpcQueryHandlerWithBoxedError, HandlerMutable,
+    };
+    use crate::test_utils::create_test_query_engine;
+
+    #[derive(Debug)]
+    struct NoopHandler;
+
+    #[async_trait::async_trait]
+    impl GrpcQueryHandlerWithBoxedError for NoopHandler {
+        async fn do_query(
+            &self,
+            _query: Request,
+            _ctx: QueryContextRef,
+        ) -> std::result::Result<Output, BoxedError> {
+            Ok(Output::new_with_affected_rows(0))
+        }
+    }
+
+    fn create_test_batching_engine() -> (BatchingEngine, HandlerMutable) {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_meta = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        futures::executor::block_on(table_meta.init()).unwrap();
+        let flow_meta = Arc::new(FlowMetadataManager::new(kv_backend));
+        let catalog_manager = new_memory_catalog_manager().unwrap();
+        let query_engine = create_test_query_engine();
+        let (frontend_client, handler_mut) =
+            FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+
+        let engine = BatchingEngine::new(
+            Arc::new(frontend_client),
+            query_engine,
+            flow_meta,
+            table_meta,
+            catalog_manager,
+            BatchingModeOptions::default(),
+        );
+        (engine, handler_mut)
+    }
+
+    async fn create_test_batching_engine_with_handler() -> BatchingEngine {
+        let (engine, handler_mut) = create_test_batching_engine();
+        let handler: Arc<dyn GrpcQueryHandlerWithBoxedError> = Arc::new(NoopHandler);
+        handler_mut.set_handler(Arc::downgrade(&handler)).await;
+        engine
+    }
+
+    fn make_create_flow_args(flow_id: u64, sql: &str, or_replace: bool) -> CreateFlowArgs {
+        CreateFlowArgs {
+            flow_id,
+            sink_table_name: [
+                "greptime".to_string(),
+                "public".to_string(),
+                format!("sink_{}", flow_id),
+            ],
+            source_table_ids: vec![1024],
+            create_if_not_exists: false,
+            or_replace,
+            expire_after: None,
+            eval_interval: Some(60),
+            comment: None,
+            sql: sql.to_string(),
+            flow_options: HashMap::new(),
+            query_ctx: Some(QueryContext::with("greptime", "public")),
+        }
+    }
+
+    fn is_flow_not_found(err: &Error) -> bool {
+        matches!(err, crate::error::Error::FlowNotFound { .. })
+    }
+
+    fn is_flow_already_exist(err: &Error) -> bool {
+        matches!(err, crate::error::Error::FlowAlreadyExist { .. })
+    }
+
+    // D1: Verify remove_flow_inner sends shutdown signal and removes task
+    #[tokio::test]
+    async fn test_remove_flow_sends_shutdown_signal() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+        let args = make_create_flow_args(1, sql, false);
+
+        engine.create_flow_inner(args).await.unwrap();
+
+        assert!(engine.tasks.read().await.contains_key(&1));
+        assert!(engine.shutdown_txs.read().await.contains_key(&1));
+
+        engine.remove_flow_inner(1).await.unwrap();
+
+        assert!(!engine.tasks.read().await.contains_key(&1));
+        assert!(!engine.shutdown_txs.read().await.contains_key(&1));
+    }
+
+    // D2: Verify remove_flow_inner aborts the task handle
+    #[tokio::test]
+    async fn test_remove_flow_aborts_task_handle() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+        let args = make_create_flow_args(1, sql, false);
+
+        engine.create_flow_inner(args).await.unwrap();
+        assert!(engine.tasks.read().await.contains_key(&1));
+
+        engine.remove_flow_inner(1).await.unwrap();
+
+        // Give the aborted task a moment to finish
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(!engine.tasks.read().await.contains_key(&1));
+        assert!(!engine.shutdown_txs.read().await.contains_key(&1));
+    }
+
+    // D3: Verify or_replace=true cancels old task before creating new one (Bug 1 core)
+    #[tokio::test]
+    async fn test_replace_flow_cancels_old_task() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // Create initial flow
+        let args = make_create_flow_args(1, sql, false);
+        engine.create_flow_inner(args).await.unwrap();
+
+        assert_eq!(engine.tasks.read().await.len(), 1);
+        assert_eq!(engine.shutdown_txs.read().await.len(), 1);
+
+        // Replace the flow
+        let args = make_create_flow_args(1, "SELECT number, ts FROM numbers_with_ts", true);
+        engine.create_flow_inner(args).await.unwrap();
+
+        // Should still have exactly one task, not two
+        assert_eq!(engine.tasks.read().await.len(), 1);
+        assert_eq!(engine.shutdown_txs.read().await.len(), 1);
+
+        // Cleanup
+        engine.remove_flow_inner(1).await.unwrap();
+    }
+
+    // D4: Verify or_replace=true on nonexistent flow creates normally
+    #[tokio::test]
+    async fn test_replace_nonexistent_flow_creates_normally() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        let args = make_create_flow_args(99, sql, true);
+        engine.create_flow_inner(args).await.unwrap();
+
+        assert_eq!(engine.tasks.read().await.len(), 1);
+        assert_eq!(engine.shutdown_txs.read().await.len(), 1);
+        assert!(engine.tasks.read().await.contains_key(&99));
+        assert!(engine.shutdown_txs.read().await.contains_key(&99));
+
+        // Cleanup
+        engine.remove_flow_inner(99).await.unwrap();
+    }
+
+    // D5: Verify removing nonexistent flow returns FlowNotFound error
+    #[tokio::test]
+    async fn test_remove_nonexistent_flow_returns_error() {
+        let engine = create_test_batching_engine_with_handler().await;
+
+        let result = engine.remove_flow_inner(999).await;
+        assert!(result.is_err());
+        assert!(is_flow_not_found(&result.unwrap_err()));
+    }
+
+    // D6: Verify create_if_not_exists=true returns None on duplicate
+    #[tokio::test]
+    async fn test_create_if_not_exists_returns_none_on_duplicate() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // First create
+        let mut args = make_create_flow_args(1, sql, false);
+        args.create_if_not_exists = false;
+        let result = engine.create_flow_inner(args).await.unwrap();
+        assert_eq!(result, Some(1));
+
+        // Second create with create_if_not_exists=true
+        let mut args = make_create_flow_args(1, sql, false);
+        args.create_if_not_exists = true;
+        let result = engine.create_flow_inner(args).await.unwrap();
+        assert_eq!(result, None);
+
+        // Should still have exactly one task
+        assert_eq!(engine.tasks.read().await.len(), 1);
+
+        // Cleanup
+        engine.remove_flow_inner(1).await.unwrap();
+    }
+
+    // D7: Verify duplicate create without replace returns FlowAlreadyExist error
+    #[tokio::test]
+    async fn test_create_duplicate_without_replace_returns_error() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        let args = make_create_flow_args(1, sql, false);
+        engine.create_flow_inner(args).await.unwrap();
+
+        // Second create with same params should fail
+        let args = make_create_flow_args(1, sql, false);
+        let result = engine.create_flow_inner(args).await;
+        assert!(result.is_err());
+        assert!(is_flow_already_exist(&result.unwrap_err()));
+
+        // Cleanup
+        engine.remove_flow_inner(1).await.unwrap();
+    }
+
+    // D8: Verify task execution loop exits promptly on shutdown during sleep (Bug 3 core)
+    #[tokio::test]
+    async fn test_task_execution_loop_exits_on_shutdown_during_sleep() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // Create with 10 second eval_interval
+        let mut args = make_create_flow_args(1, sql, false);
+        args.eval_interval = Some(10);
+        engine.create_flow_inner(args).await.unwrap();
+
+        // Wait for task to enter sleep phase
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send shutdown and verify task exits within 2 seconds (not 10)
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            engine.remove_flow_inner(1).await.unwrap();
+            // Give time for the task to actually stop
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Task should exit promptly on shutdown, not wait for full eval_interval");
+    }
+
+    // D9: Verify old task handle is aborted when replacing (Bug 1+2 combined)
+    #[tokio::test]
+    async fn test_replace_then_verify_old_task_handle_aborted() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // Create initial flow
+        let args = make_create_flow_args(1, sql, false);
+        engine.create_flow_inner(args).await.unwrap();
+
+        // Verify handle exists
+        {
+            let tasks = engine.tasks.read().await;
+            let task = tasks.get(&1).unwrap();
+            let state = task.state.read().unwrap();
+            assert!(state.task_handle.is_some());
+        }
+
+        // Replace the flow
+        let args = make_create_flow_args(1, sql, true);
+        engine.create_flow_inner(args).await.unwrap();
+
+        // Give old task time to abort
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Should still have exactly one task
+        assert_eq!(engine.tasks.read().await.len(), 1);
+
+        // New task should have a handle
+        {
+            let tasks = engine.tasks.read().await;
+            let task = tasks.get(&1).unwrap();
+            let state = task.state.read().unwrap();
+            assert!(state.task_handle.is_some());
+        }
+
+        // Cleanup
+        engine.remove_flow_inner(1).await.unwrap();
+    }
+
+    // D10: Verify list_flows reflects current state after create/remove/replace
+    #[tokio::test]
+    async fn test_list_flows_after_create_and_remove() {
+        let engine = create_test_batching_engine_with_handler().await;
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // Initially empty
+        let flows = engine.list_flows().await.unwrap();
+        assert_eq!(flows.into_iter().count(), 0);
+
+        // Create two flows
+        engine.create_flow_inner(make_create_flow_args(1, sql, false)).await.unwrap();
+        engine.create_flow_inner(make_create_flow_args(2, sql, false)).await.unwrap();
+
+        let flows: Vec<_> = engine.list_flows().await.unwrap().into_iter().collect();
+        assert_eq!(flows.len(), 2);
+        assert!(flows.contains(&1));
+        assert!(flows.contains(&2));
+
+        // Remove flow 1
+        engine.remove_flow_inner(1).await.unwrap();
+        let flows: Vec<_> = engine.list_flows().await.unwrap().into_iter().collect();
+        assert_eq!(flows.len(), 1);
+        assert!(flows.contains(&2));
+
+        // Replace flow 2
+        engine.create_flow_inner(make_create_flow_args(2, sql, true)).await.unwrap();
+        let flows: Vec<_> = engine.list_flows().await.unwrap().into_iter().collect();
+        assert_eq!(flows.len(), 1);
+        assert!(flows.contains(&2));
+
+        // Cleanup
+        engine.remove_flow_inner(2).await.unwrap();
+    }
+
+    // D11: Verify concurrent create/replace/remove operations are thread-safe
+    #[tokio::test]
+    async fn test_concurrent_remove_and_replace() {
+        let engine = Arc::new(create_test_batching_engine_with_handler().await);
+        let sql = "SELECT number, ts FROM numbers_with_ts";
+
+        // First create all flows sequentially
+        for i in 0..5u64 {
+            engine.create_flow_inner(make_create_flow_args(i, sql, false)).await.unwrap();
+        }
+        assert_eq!(engine.tasks.read().await.len(), 5);
+
+        // Now concurrently replace and remove
+        let mut handles = Vec::new();
+        for i in 0..5u64 {
+            let engine = engine.clone();
+            let sql = sql.to_string();
+            let h = tokio::spawn(async move {
+                // Replace
+                engine.create_flow_inner(make_create_flow_args(i, &sql, true)).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Remove
+                engine.remove_flow_inner(i).await.unwrap();
+            });
+            handles.push(h);
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Give aborted tasks time to finish
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(engine.tasks.read().await.len(), 0);
+        assert_eq!(engine.shutdown_txs.read().await.len(), 0);
     }
 }

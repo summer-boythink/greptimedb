@@ -455,6 +455,43 @@ impl BatchingTask {
         Ok(Some((res, elapsed)))
     }
 
+    /// Check if shutdown signal has been received (non-blocking).
+    /// Returns true if the task should stop.
+    fn is_shutdown(&self) -> bool {
+        let mut state = self.state.write().unwrap();
+        match state.shutdown_rx.try_recv() {
+            Ok(()) => true,
+            Err(TryRecvError::Closed) => {
+                warn!(
+                    "Unexpected shutdown flow {}, shutdown anyway",
+                    self.config.flow_id
+                );
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+
+    /// Wait for shutdown signal (blocking). Used inside tokio::select!.
+    /// Returns when shutdown is signaled.
+    async fn wait_shutdown(&self) {
+        loop {
+            if self.is_shutdown() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Sleep for the given duration, but return early if shutdown is signaled.
+    /// Returns true if shutdown was signaled, false if the sleep completed normally.
+    async fn sleep_with_shutdown_check(&self, duration: Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => false,
+            _ = self.wait_shutdown() => true,
+        }
+    }
+
     /// start executing query in a loop, break when receive shutdown signal
     ///
     /// any error will be logged when executing query
@@ -475,20 +512,10 @@ impl BatchingTask {
         loop {
             // first check if shutdown signal is received
             // if so, break the loop
-            {
-                let mut state = self.state.write().unwrap();
-                match state.shutdown_rx.try_recv() {
-                    Ok(()) => break,
-                    Err(TryRecvError::Closed) => {
-                        warn!(
-                            "Unexpected shutdown flow {}, shutdown anyway",
-                            self.config.flow_id
-                        );
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => (),
-                }
+            if self.is_shutdown() {
+                break;
             }
+
             METRIC_FLOW_BATCHING_ENGINE_START_QUERY_CNT
                 .with_label_values(&[&flow_id_str])
                 .inc();
@@ -500,10 +527,17 @@ impl BatchingTask {
                 Err(err) => {
                     common_telemetry::error!(err; "Failed to generate query for flow={}", self.config.flow_id);
                     // also sleep for a little while before try again to prevent flooding logs
-                    tokio::time::sleep(min_refresh).await;
+                    if self.sleep_with_shutdown_check(min_refresh).await {
+                        break;
+                    }
                     continue;
                 }
             };
+
+            // Check shutdown before executing the potentially long-running query
+            if self.is_shutdown() {
+                break;
+            }
 
             let res = if let Some(new_query) = &new_query {
                 self.execute_logical_plan(&frontend_client, &new_query.plan)
@@ -522,7 +556,11 @@ impl BatchingTask {
 
                     // here use proper ticking if set eval interval
                     if let Some(eval_interval) = &mut interval {
-                        eval_interval.tick().await;
+                        // Use select! to respond to shutdown during tick wait
+                        tokio::select! {
+                            _ = eval_interval.tick() => {}
+                            _ = self.wait_shutdown() => { break; }
+                        }
                     } else {
                         // if not explicitly set, just automatically calculate next start time
                         // using time window size and more args
@@ -544,7 +582,11 @@ impl BatchingTask {
                             )
                         };
 
-                        tokio::time::sleep_until(sleep_until).await;
+                        // Use select! to respond to shutdown during sleep
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(sleep_until) => {}
+                            _ = self.wait_shutdown() => { break; }
+                        }
                     };
                 }
                 // no new data, sleep for some time before checking for new data
@@ -553,7 +595,9 @@ impl BatchingTask {
                         "Flow id = {:?} found no new data, sleep for {:?} then continue",
                         self.config.flow_id, min_refresh
                     );
-                    tokio::time::sleep(min_refresh).await;
+                    if self.sleep_with_shutdown_check(min_refresh).await {
+                        break;
+                    }
                     continue;
                 }
                 // TODO(discord9): this error should have better place to go, but for now just print error, also more context is needed
@@ -579,10 +623,13 @@ impl BatchingTask {
                         }
                     }
                     // also sleep for a little while before try again to prevent flooding logs
-                    tokio::time::sleep(min_refresh).await;
+                    if self.sleep_with_shutdown_check(min_refresh).await {
+                        break;
+                    }
                 }
             }
         }
+        info!("Flow {} execution loop exited", self.config.flow_id);
     }
 
     /// Generate the create table SQL
