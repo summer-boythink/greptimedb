@@ -33,11 +33,16 @@ function upload_artifacts() {
   #    └── greptime-darwin-amd64-v0.2.0.tar.gz
   find "$ARTIFACTS_DIR" -type f \( -name "*.tar.gz" -o -name "*.sha256sum" \) | while IFS= read -r file; do
     filename=$(basename "$file")
-    TARGET_URL="$PROXY_URL/$RELEASE_DIRS/$VERSION/$filename"
+    TARGET_URL="$PROXY_URL/$RELEASE_DIRS/$VERSION"
 
     curl -X PUT \
       -u "$PROXY_USERNAME:$PROXY_PASSWORD" \
       -F "file=@$file" \
+      --max-time 3600 \
+      --connect-timeout 20 \
+      --retry 5 \
+      --retry-delay 10 \
+      --retry-max-time 3000 \
       "$TARGET_URL"
   done
 }
@@ -49,11 +54,16 @@ function update_version_info() {
     if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "Updating latest-version.txt"
       echo "$VERSION" > latest-version.txt
-      TARGET_URL="$PROXY_URL/$RELEASE_DIRS/latest-version.txt"
+      TARGET_URL="$PROXY_URL/$RELEASE_DIRS"
 
       curl -X PUT \
         -u "$PROXY_USERNAME:$PROXY_PASSWORD" \
         -F "file=@latest-version.txt" \
+        --max-time 3600 \
+        --connect-timeout 20 \
+        --retry 5 \
+        --retry-delay 10 \
+        --retry-max-time 3000 \
         "$TARGET_URL"
     fi
 
@@ -62,10 +72,15 @@ function update_version_info() {
       echo "Updating latest-nightly-version.txt"
       echo "$VERSION" > latest-nightly-version.txt
 
-      TARGET_URL="$PROXY_URL/$RELEASE_DIRS/latest-nightly-version.txt"
+      TARGET_URL="$PROXY_URL/$RELEASE_DIRS"
       curl -X PUT \
         -u "$PROXY_USERNAME:$PROXY_PASSWORD" \
         -F "file=@latest-nightly-version.txt" \
+        --max-time 3600 \
+        --connect-timeout 20 \
+        --retry 5 \
+        --retry-delay 10 \
+        --retry-max-time 3000 \
         "$TARGET_URL"
     fi
   fi

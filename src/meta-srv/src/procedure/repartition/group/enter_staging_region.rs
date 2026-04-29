@@ -315,7 +315,14 @@ impl EnterStagingRegion {
                 );
 
                 Ok(())
-            }
+            },
+            Err(error::Error::MailboxChannelClosed {..})=> error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending enter staging regions to datanode {:?}, elapsed: {:?}",
+                    peer,
+                    now.elapsed()
+                ),
+            }.fail()?,
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
                     "Mailbox received timeout for enter staging regions on datanode {:?}, elapsed: {:?}",
@@ -433,7 +440,7 @@ impl EnterStagingRegion {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
     use std::time::Duration;
 
     use common_meta::instruction::StagingPartitionDirective;

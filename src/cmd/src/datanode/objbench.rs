@@ -190,6 +190,7 @@ impl ObjbenchCommand {
             sequence: None,
             partition_expr: None,
             num_series: 0,
+            ..Default::default()
         };
         let src_handle = FileHandle::new(file_meta, new_noop_file_purger());
 
@@ -211,7 +212,6 @@ impl ObjbenchCommand {
             object_store.clone(),
         )
         .expected_metadata(Some(region_meta.clone()))
-        .flat_format(true)
         .build()
         .await
         .map_err(|e| {

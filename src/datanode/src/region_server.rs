@@ -360,6 +360,7 @@ impl RegionServer {
             engine.role(region_id).map(|role| match role {
                 RegionRole::Follower => false,
                 RegionRole::Leader => true,
+                RegionRole::StagingLeader => true,
                 RegionRole::DowngradingLeader => true,
             })
         })
@@ -1667,7 +1668,7 @@ impl RegionAttribute {
 #[cfg(test)]
 mod tests {
 
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
 
     use api::v1::SemanticType;
     use common_error::ext::ErrorExt;

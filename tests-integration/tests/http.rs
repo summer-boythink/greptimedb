@@ -40,7 +40,9 @@ use loki_proto::logproto::{EntryAdapter, LabelPairAdapter, PushRequest, StreamAd
 use loki_proto::prost_types::Timestamp;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 use pipeline::GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME;
 use prost::Message;
 use serde_json::{Value, json};
@@ -50,6 +52,7 @@ use servers::http::header::constants::{
     GREPTIME_LOG_TABLE_NAME_HEADER_NAME, GREPTIME_PIPELINE_NAME_HEADER_NAME,
 };
 use servers::http::header::{GREPTIME_DB_HEADER_NAME, GREPTIME_TIMEZONE_HEADER_NAME};
+use servers::http::otlp::GoogleRpcStatus;
 use servers::http::prometheus::{Column, PrometheusJsonResponse, PrometheusResponse};
 use servers::http::result::error_result::ErrorResponse;
 use servers::http::result::greptime_result_v1::GreptimedbV1Response;
@@ -132,6 +135,7 @@ macro_rules! http_tests {
                 test_pipeline_skip_error,
                 test_pipeline_filter,
                 test_pipeline_create_table,
+                test_pipeline_index_options,
 
                 test_otlp_metrics_new,
                 test_otlp_traces_v0,
@@ -1174,6 +1178,20 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .await;
     assert_eq!(res.status(), StatusCode::OK);
 
+    // query non-exist label in metric table
+    let res = client
+        .get("/v1/prometheus/api/v1/label/not_exist_label/values?match[]=demo&start=0&end=600")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let prom_resp = res.json::<PrometheusJsonResponse>().await;
+    assert_eq!(prom_resp.status, "success");
+    assert!(prom_resp.error.is_none() && prom_resp.error_type.is_none());
+    assert_eq!(
+        prom_resp.data,
+        serde_json::from_value::<PrometheusResponse>(json!([])).unwrap()
+    );
+
     // query `__name__` without match[]
     // create a physical table and a logical table
     let res = client
@@ -1483,6 +1501,11 @@ enable = true
 [prom_store]
 enable = true
 with_metric_engine = true
+pending_rows_flush_interval = "0s"
+max_batch_rows = 100000
+max_concurrent_flushes = 256
+worker_channel_capacity = 65526
+max_inflight_requests = 3000
 
 [wal]
 provider = "raft_engine"
@@ -1515,7 +1538,6 @@ experimental_min_refresh_duration = "5s"
 grpc_conn_timeout = "5s"
 experimental_grpc_max_retries = 3
 experimental_frontend_scan_timeout = "30s"
-experimental_frontend_activity_timeout = "1m"
 experimental_max_filter_num_per_query = 20
 experimental_time_window_merge_threshold = 3
 read_preference = "Leader"
@@ -1545,11 +1567,11 @@ index_cache_percent = 20
 enable_refill_cache_on_read = true
 manifest_cache_size = "256MiB"
 sst_write_buffer_size = "8MiB"
-parallel_scan_channel_size = 32
 max_concurrent_scan_files = 384
 allow_stale_entries = false
+scan_memory_on_exhausted = "fail"
 min_compaction_interval = "0s"
-default_experimental_flat_format = false
+default_flat_format = true
 
 [region_engine.mito.index]
 aux_path = ""
@@ -1642,6 +1664,7 @@ fn drop_lines_with_inconsistent_results(input: String) -> String {
         "metadata_cache_size =",
         "content_cache_size =",
         "result_cache_size =",
+        "range_result_cache_size =",
         "name =",
         "recovery_parallelism =",
         "max_background_index_builds =",
@@ -3049,6 +3072,82 @@ transform:
         "CREATE TABLE IF NOT EXISTS `logs1` (\n  `timestamp` TIMESTAMP(9) NOT NULL,\n  `ip_address` STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  `username` STRING NULL,\n  `http_method` STRING NULL INVERTED INDEX,\n  `request_line` STRING NULL FULLTEXT INDEX WITH(analyzer = 'English', backend = 'bloom', case_sensitive = 'false', false_positive_rate = '0.01', granularity = '10240'),\n  `protocol` STRING NULL,\n  `status_code` INT NULL INVERTED INDEX,\n  `response_size` BIGINT NULL,\n  `message` STRING NULL,\n  TIME INDEX (`timestamp`),\n  PRIMARY KEY (`username`, `status_code`)\n)\nENGINE=mito\nWITH(\n  append_mode = 'true'\n)",
         sql
     );
+
+    guard.remove_all().await;
+}
+
+pub async fn test_pipeline_index_options(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_http_app_with_frontend(store_type, "test_pipeline_index_options").await;
+
+    let client = TestClient::new(app).await;
+
+    let pipeline_body = r#"
+processors:
+  - date:
+      field: ts
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+      ignore_missing: true
+
+transform:
+  - field: message
+    type: string
+    index:
+      type: fulltext
+      options:
+        analyzer: Chinese
+        case_sensitive: true
+        backend: bloom
+        granularity: 2048
+        false_positive_rate: 0.02
+  - field: trace_id
+    type: int64
+    index:
+      type: skipping
+      options:
+        granularity: 1024
+        false_positive_rate: 0.05
+        type: BLOOM
+  - field: ts
+    type: time
+    index: timestamp
+"#;
+
+    let res = client
+        .post("/v1/pipelines/index_options")
+        .header("Content-Type", "application/x-yaml")
+        .body(pipeline_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let data_body = r#"
+[
+  {
+    "message": "hello greptime",
+    "trace_id": 42,
+    "ts": "2024-05-25 20:16:37.217"
+  }
+]
+"#;
+    let res = client
+        .post("/v1/ingest?db=public&table=pipeline_index_options&pipeline_name=index_options")
+        .header("Content-Type", "application/json")
+        .body(data_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let expected_schema = "[[\"pipeline_index_options\",\"CREATE TABLE IF NOT EXISTS \\\"pipeline_index_options\\\" (\\n  \\\"message\\\" STRING NULL FULLTEXT INDEX WITH(analyzer = 'Chinese', backend = 'bloom', case_sensitive = 'true', false_positive_rate = '0.02', granularity = '2048'),\\n  \\\"trace_id\\\" BIGINT NULL SKIPPING INDEX WITH(false_positive_rate = '0.05', granularity = '1024', type = 'BLOOM'),\\n  \\\"ts\\\" TIMESTAMP(9) NOT NULL,\\n  TIME INDEX (\\\"ts\\\")\\n)\\n\\nENGINE=mito\\nWITH(\\n  'comment' = 'Created on insertion',\\n  append_mode = 'true'\\n)\"]]";
+    validate_data(
+        "pipeline_index_options_schema",
+        &client,
+        "show create table pipeline_index_options",
+        expected_schema,
+    )
+    .await;
 
     guard.remove_all().await;
 }
@@ -5243,6 +5342,146 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
     let res = client.get("/v1/sql?sql=drop table mytable;").send().await;
     assert_eq!(res.status(), StatusCode::OK);
 
+    // test trace table with custom partitions: 1
+    let trace_table_part1 = "trace_table_part1";
+    let res = send_req(
+        &client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static(GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME),
+            ),
+            (
+                HeaderName::from_static("x-greptime-trace-table-name"),
+                HeaderValue::from_static(trace_table_part1),
+            ),
+            (
+                HeaderName::from_static("x-greptime-hints"),
+                HeaderValue::from_static("trace_table_partitions=1"),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        body.clone(),
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+    let expected_ddl = r#"[["trace_table_part1","CREATE TABLE IF NOT EXISTS \"trace_table_part1\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"timestamp_end\" TIMESTAMP(9) NULL,\n  \"duration_nano\" BIGINT UNSIGNED NULL,\n  \"parent_span_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"trace_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_id\" STRING NULL,\n  \"span_kind\" STRING NULL,\n  \"span_name\" STRING NULL,\n  \"span_status_code\" STRING NULL,\n  \"span_status_message\" STRING NULL,\n  \"trace_state\" STRING NULL,\n  \"scope_name\" STRING NULL,\n  \"scope_version\" STRING NULL,\n  \"service_name\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_attributes.net.peer.ip\" STRING NULL,\n  \"span_attributes.peer.service\" STRING NULL,\n  \"span_events\" JSON NULL,\n  \"span_links\" JSON NULL,\n  TIME INDEX (\"timestamp\"),\n  PRIMARY KEY (\"service_name\")\n)\n\nENGINE=mito\nWITH(\n  'comment' = 'Created on insertion',\n  append_mode = 'true',\n  table_data_model = 'greptime_trace_v1'\n)"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        "show create table trace_table_part1;",
+        expected_ddl,
+    )
+    .await;
+
+    // test trace table with custom partitions: 4
+    let trace_table_part4 = "trace_table_part4";
+    let res = send_req(
+        &client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static(GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME),
+            ),
+            (
+                HeaderName::from_static("x-greptime-trace-table-name"),
+                HeaderValue::from_static(trace_table_part4),
+            ),
+            (
+                HeaderName::from_static("x-greptime-hints"),
+                HeaderValue::from_static("trace_table_partitions=4"),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        body.clone(),
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+    let expected_ddl = r#"[["trace_table_part4","CREATE TABLE IF NOT EXISTS \"trace_table_part4\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"timestamp_end\" TIMESTAMP(9) NULL,\n  \"duration_nano\" BIGINT UNSIGNED NULL,\n  \"parent_span_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"trace_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_id\" STRING NULL,\n  \"span_kind\" STRING NULL,\n  \"span_name\" STRING NULL,\n  \"span_status_code\" STRING NULL,\n  \"span_status_message\" STRING NULL,\n  \"trace_state\" STRING NULL,\n  \"scope_name\" STRING NULL,\n  \"scope_version\" STRING NULL,\n  \"service_name\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_attributes.net.peer.ip\" STRING NULL,\n  \"span_attributes.peer.service\" STRING NULL,\n  \"span_events\" JSON NULL,\n  \"span_links\" JSON NULL,\n  TIME INDEX (\"timestamp\"),\n  PRIMARY KEY (\"service_name\")\n)\nPARTITION ON COLUMNS (\"trace_id\") (\n  trace_id < '4',\n  trace_id >= '4' AND trace_id < '8',\n  trace_id >= '8' AND trace_id < 'c',\n  trace_id >= 'c'\n)\nENGINE=mito\nWITH(\n  'comment' = 'Created on insertion',\n  append_mode = 'true',\n  table_data_model = 'greptime_trace_v1'\n)"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        "show create table trace_table_part4;",
+        expected_ddl,
+    )
+    .await;
+
+    // test trace table with custom partitions: 32
+    let trace_table_part32 = "trace_table_part32";
+    let res = send_req(
+        &client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static(GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME),
+            ),
+            (
+                HeaderName::from_static("x-greptime-trace-table-name"),
+                HeaderValue::from_static(trace_table_part32),
+            ),
+            (
+                HeaderName::from_static("x-greptime-hints"),
+                HeaderValue::from_static("trace_table_partitions=32"),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        body.clone(),
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+    let expected_ddl = r#"[["trace_table_part32","CREATE TABLE IF NOT EXISTS \"trace_table_part32\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"timestamp_end\" TIMESTAMP(9) NULL,\n  \"duration_nano\" BIGINT UNSIGNED NULL,\n  \"parent_span_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"trace_id\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_id\" STRING NULL,\n  \"span_kind\" STRING NULL,\n  \"span_name\" STRING NULL,\n  \"span_status_code\" STRING NULL,\n  \"span_status_message\" STRING NULL,\n  \"trace_state\" STRING NULL,\n  \"scope_name\" STRING NULL,\n  \"scope_version\" STRING NULL,\n  \"service_name\" STRING NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '10240', type = 'BLOOM'),\n  \"span_attributes.net.peer.ip\" STRING NULL,\n  \"span_attributes.peer.service\" STRING NULL,\n  \"span_events\" JSON NULL,\n  \"span_links\" JSON NULL,\n  TIME INDEX (\"timestamp\"),\n  PRIMARY KEY (\"service_name\")\n)\nPARTITION ON COLUMNS (\"trace_id\") (\n  trace_id < '08',\n  trace_id >= '08' AND trace_id < '10',\n  trace_id >= '10' AND trace_id < '18',\n  trace_id >= '18' AND trace_id < '20',\n  trace_id >= '20' AND trace_id < '28',\n  trace_id >= '28' AND trace_id < '30',\n  trace_id >= '30' AND trace_id < '38',\n  trace_id >= '38' AND trace_id < '40',\n  trace_id >= '40' AND trace_id < '48',\n  trace_id >= '48' AND trace_id < '50',\n  trace_id >= '50' AND trace_id < '58',\n  trace_id >= '58' AND trace_id < '60',\n  trace_id >= '60' AND trace_id < '68',\n  trace_id >= '68' AND trace_id < '70',\n  trace_id >= '70' AND trace_id < '78',\n  trace_id >= '78' AND trace_id < '80',\n  trace_id >= '80' AND trace_id < '88',\n  trace_id >= '88' AND trace_id < '90',\n  trace_id >= '90' AND trace_id < '98',\n  trace_id >= '98' AND trace_id < 'a0',\n  trace_id >= 'a0' AND trace_id < 'a8',\n  trace_id >= 'a8' AND trace_id < 'b0',\n  trace_id >= 'b0' AND trace_id < 'b8',\n  trace_id >= 'b8' AND trace_id < 'c0',\n  trace_id >= 'c0' AND trace_id < 'c8',\n  trace_id >= 'c8' AND trace_id < 'd0',\n  trace_id >= 'd0' AND trace_id < 'd8',\n  trace_id >= 'd8' AND trace_id < 'e0',\n  trace_id >= 'e0' AND trace_id < 'e8',\n  trace_id >= 'e8' AND trace_id < 'f0',\n  trace_id >= 'f0' AND trace_id < 'f8',\n  trace_id >= 'f8'\n)\nENGINE=mito\nWITH(\n  'comment' = 'Created on insertion',\n  append_mode = 'true',\n  table_data_model = 'greptime_trace_v1'\n)"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        "show create table trace_table_part32;",
+        expected_ddl,
+    )
+    .await;
+
+    // invalid partition count
+    let trace_table_part_abc = "trace_table_part_abc";
+    let res = send_req(
+        &client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static(GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME),
+            ),
+            (
+                HeaderName::from_static("x-greptime-trace-table-name"),
+                HeaderValue::from_static(trace_table_part_abc),
+            ),
+            (
+                HeaderName::from_static("x-greptime-hints"),
+                HeaderValue::from_static("trace_table_partitions=abc"),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        body.clone(),
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::BAD_REQUEST, res.status());
+
     // write traces data with gzip
     let res = send_req(
         &client,
@@ -5275,6 +5514,561 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
         expected,
     )
     .await;
+
+    let coercion_table_name = "trace_type_coercion";
+    let coercion_req = make_trace_v1_request(
+        "type-coercion",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000001",
+            "0000000000000001",
+            "coercion-seed",
+            1_736_480_942_444_376_000,
+            1_736_480_942_444_499_000,
+            vec![
+                make_double_attr("attr_float", 1.5),
+                make_int_attr("attr_int", 10),
+                make_bool_attr("attr_bool", true),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(&client, coercion_table_name, coercion_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let coercion_req = make_trace_v1_request(
+        "type-coercion",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000002",
+            "0000000000000002",
+            "coercion-apply",
+            1_736_480_942_444_589_000,
+            1_736_480_942_444_712_000,
+            vec![
+                make_int_attr("attr_float", 2),
+                make_string_attr("attr_int", "20"),
+                make_string_attr("attr_bool", "false"),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(&client, coercion_table_name, coercion_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let string_target_table_name = "trace_type_coercion_to_string";
+    let string_target_seed_req = make_trace_v1_request(
+        "type-coercion-string",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000021",
+            "0000000000000021",
+            "string-target-seed",
+            1_736_480_942_444_720_000,
+            1_736_480_942_444_820_000,
+            vec![
+                make_string_attr("attr_int", "seed"),
+                make_string_attr("attr_float", "seed"),
+                make_string_attr("attr_bool", "seed"),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        string_target_table_name,
+        string_target_seed_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let string_target_req = make_trace_v1_request(
+        "type-coercion-string",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000022",
+            "0000000000000022",
+            "string-target-apply",
+            1_736_480_942_444_830_000,
+            1_736_480_942_444_930_000,
+            vec![
+                make_int_attr("attr_int", 20),
+                make_double_attr("attr_float", 2.5),
+                make_bool_attr("attr_bool", false),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(&client, string_target_table_name, string_target_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    validate_data(
+        "otlp_traces_v1_type_coercion_to_string_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_bool\", \"span_attributes.attr_float\", \"span_attributes.attr_int\" from {} order by trace_id;",
+            string_target_table_name
+        ),
+        r#"[["00000000000000000000000000000021","seed","seed","seed"],["00000000000000000000000000000022","false","2.5","20"]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_type_coercion_to_string_schema",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_coercion_to_string' and column_name in ('span_attributes.attr_bool', 'span_attributes.attr_float', 'span_attributes.attr_int') order by column_name;",
+        r#"[["span_attributes.attr_bool","string","FIELD"],["span_attributes.attr_float","string","FIELD"],["span_attributes.attr_int","string","FIELD"]]"#,
+    )
+    .await;
+
+    let intra_batch_prefer_non_string_table_name = "trace_type_prefer_non_string";
+    let intra_batch_prefer_non_string_req = make_trace_v1_request(
+        "type-prefer-non-string",
+        vec![
+            make_trace_v1_span(
+                "00000000000000000000000000000031",
+                "0000000000000031",
+                "prefer-non-string-seed",
+                1_736_480_942_444_940_000,
+                1_736_480_942_445_040_000,
+                vec![
+                    make_string_attr("attr_int", "10"),
+                    make_string_attr("attr_float", "1.5"),
+                    make_string_attr("attr_bool", "true"),
+                ],
+            ),
+            make_trace_v1_span(
+                "00000000000000000000000000000032",
+                "0000000000000032",
+                "prefer-non-string-apply",
+                1_736_480_942_445_050_000,
+                1_736_480_942_445_150_000,
+                vec![
+                    make_int_attr("attr_int", 20),
+                    make_double_attr("attr_float", 2.5),
+                    make_bool_attr("attr_bool", false),
+                ],
+            ),
+        ],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        intra_batch_prefer_non_string_table_name,
+        intra_batch_prefer_non_string_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    validate_data(
+        "otlp_traces_v1_prefer_non_string_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_bool\", \"span_attributes.attr_float\", \"span_attributes.attr_int\" from {} order by trace_id;",
+            intra_batch_prefer_non_string_table_name
+        ),
+        r#"[["00000000000000000000000000000031",true,1.5,10],["00000000000000000000000000000032",false,2.5,20]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_prefer_non_string_schema",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_prefer_non_string' and column_name in ('span_attributes.attr_bool', 'span_attributes.attr_float', 'span_attributes.attr_int') order by column_name;",
+        r#"[["span_attributes.attr_bool","boolean","FIELD"],["span_attributes.attr_float","double","FIELD"],["span_attributes.attr_int","bigint","FIELD"]]"#,
+    )
+    .await;
+
+    let existing_float_table_name = "trace_type_existing_float_prefers_schema";
+    let existing_float_seed_req = make_trace_v1_request(
+        "type-existing-float",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000041",
+            "0000000000000041",
+            "existing-float-seed",
+            1_736_480_942_445_160_000,
+            1_736_480_942_445_260_000,
+            vec![make_double_attr("attr_num", 1.25)],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_float_table_name,
+        existing_float_seed_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let existing_float_req = make_trace_v1_request(
+        "type-existing-float",
+        vec![
+            make_trace_v1_span(
+                "00000000000000000000000000000042",
+                "0000000000000042",
+                "existing-float-int-first",
+                1_736_480_942_445_270_000,
+                1_736_480_942_445_370_000,
+                vec![make_int_attr("attr_num", 2)],
+            ),
+            make_trace_v1_span(
+                "00000000000000000000000000000043",
+                "0000000000000043",
+                "existing-float-float-later",
+                1_736_480_942_445_380_000,
+                1_736_480_942_445_480_000,
+                vec![make_double_attr("attr_num", 3.5)],
+            ),
+        ],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_float_table_name,
+        existing_float_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    validate_data(
+        "otlp_traces_v1_existing_float_prefers_schema_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_num\" from {} order by trace_id;",
+            existing_float_table_name
+        ),
+        r#"[["00000000000000000000000000000041",1.25],["00000000000000000000000000000042",2.0],["00000000000000000000000000000043",3.5]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_existing_float_prefers_schema_type",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_existing_float_prefers_schema' and column_name = 'span_attributes.attr_num';",
+        r#"[["span_attributes.attr_num","double","FIELD"]]"#,
+    )
+    .await;
+
+    let existing_int_table_name = "trace_type_existing_int_widens_to_float";
+    let existing_int_seed_req = make_trace_v1_request(
+        "type-existing-int",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000051",
+            "0000000000000051",
+            "existing-int-seed",
+            1_736_480_942_445_490_000,
+            1_736_480_942_445_590_000,
+            vec![make_int_attr("attr_num", 1)],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_int_table_name,
+        existing_int_seed_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let existing_int_req = make_trace_v1_request(
+        "type-existing-int",
+        vec![
+            make_trace_v1_span(
+                "00000000000000000000000000000052",
+                "0000000000000052",
+                "existing-int-upcast-int",
+                1_736_480_942_445_600_000,
+                1_736_480_942_445_700_000,
+                vec![make_int_attr("attr_num", 2)],
+            ),
+            make_trace_v1_span(
+                "00000000000000000000000000000053",
+                "0000000000000053",
+                "existing-int-upcast-float",
+                1_736_480_942_445_710_000,
+                1_736_480_942_445_810_000,
+                vec![make_double_attr("attr_num", 3.5)],
+            ),
+        ],
+    );
+    let res = send_trace_v1_req(&client, existing_int_table_name, existing_int_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    validate_data(
+        "otlp_traces_v1_existing_int_widens_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_num\" from {} order by trace_id;",
+            existing_int_table_name
+        ),
+        r#"[["00000000000000000000000000000051",1.0],["00000000000000000000000000000052",2.0],["00000000000000000000000000000053",3.5]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_existing_int_widens_type",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_existing_int_widens_to_float' and column_name = 'span_attributes.attr_num';",
+        r#"[["span_attributes.attr_num","double","FIELD"]]"#,
+    )
+    .await;
+
+    let existing_int_atomic_table_name = "trace_type_existing_int_widen_atomic";
+    let existing_int_atomic_seed_req = make_trace_v1_request(
+        "type-existing-int-atomic",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000054",
+            "0000000000000054",
+            "existing-int-atomic-seed",
+            1_736_480_942_445_720_000,
+            1_736_480_942_445_820_000,
+            vec![
+                make_int_attr("attr_num", 1),
+                make_int_attr("attr_parse", 10),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_int_atomic_table_name,
+        existing_int_atomic_seed_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let existing_int_atomic_req = make_trace_v1_request(
+        "type-existing-int-atomic",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000055",
+            "0000000000000055",
+            "existing-int-atomic-invalid",
+            1_736_480_942_445_830_000,
+            1_736_480_942_445_930_000,
+            vec![
+                make_double_attr("attr_num", 3.5),
+                make_string_attr("attr_parse", "not_a_number"),
+            ],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_int_atomic_table_name,
+        existing_int_atomic_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::BAD_REQUEST, res.status());
+    let body = res.bytes().await;
+    let status = GoogleRpcStatus::decode(body.as_ref()).unwrap();
+    assert!(
+        status
+            .message
+            .contains("Accepted 0 spans, rejected 1 spans"),
+        "unexpected error body: {status:?}"
+    );
+
+    validate_data(
+        "otlp_traces_v1_existing_int_widen_atomic_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_num\", \"span_attributes.attr_parse\" from {} order by trace_id;",
+            existing_int_atomic_table_name
+        ),
+        r#"[["00000000000000000000000000000054",1,10]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_existing_int_widen_atomic_types",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_existing_int_widen_atomic' and column_name in ('span_attributes.attr_num', 'span_attributes.attr_parse') order by column_name;",
+        r#"[["span_attributes.attr_num","bigint","FIELD"],["span_attributes.attr_parse","bigint","FIELD"]]"#,
+    )
+    .await;
+
+    let existing_int_float_only_table_name = "trace_type_existing_int_float_only";
+    let existing_int_float_only_seed_req = make_trace_v1_request(
+        "type-existing-int-float-only",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000061",
+            "0000000000000061",
+            "existing-int-float-only-seed",
+            1_736_480_942_445_820_000,
+            1_736_480_942_445_920_000,
+            vec![make_int_attr("attr_num", 1)],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_int_float_only_table_name,
+        existing_int_float_only_seed_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let existing_int_float_only_req = make_trace_v1_request(
+        "type-existing-int-float-only",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000062",
+            "0000000000000062",
+            "existing-int-float-only-apply",
+            1_736_480_942_445_930_000,
+            1_736_480_942_446_030_000,
+            vec![make_double_attr("attr_num", 2.5)],
+        )],
+    );
+    let res = send_trace_v1_req(
+        &client,
+        existing_int_float_only_table_name,
+        existing_int_float_only_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    validate_data(
+        "otlp_traces_v1_existing_int_float_only_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_num\" from {} order by trace_id;",
+            existing_int_float_only_table_name
+        ),
+        r#"[["00000000000000000000000000000061",1.0],["00000000000000000000000000000062",2.5]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_existing_int_float_only_type",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_existing_int_float_only' and column_name = 'span_attributes.attr_num';",
+        r#"[["span_attributes.attr_num","double","FIELD"]]"#,
+    )
+    .await;
+
+    validate_data(
+        "otlp_traces_v1_type_coercion_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_int\", \"span_attributes.attr_bool\" from {} order by trace_id;",
+            coercion_table_name
+        ),
+        r#"[["00000000000000000000000000000001",10,true],["00000000000000000000000000000002",20,false]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_type_coercion_float_sum",
+        &client,
+        &format!(
+            "select sum(\"span_attributes.attr_float\") from {};",
+            coercion_table_name
+        ),
+        r#"[[3.5]]"#,
+    )
+    .await;
+    validate_data(
+        "otlp_traces_v1_type_coercion_schema",
+        &client,
+        "select column_name, lower(data_type), semantic_type from information_schema.columns where table_name = 'trace_type_coercion' and column_name in ('span_attributes.attr_bool', 'span_attributes.attr_float', 'span_attributes.attr_int') order by column_name;",
+        r#"[["span_attributes.attr_bool","boolean","FIELD"],["span_attributes.attr_float","double","FIELD"],["span_attributes.attr_int","bigint","FIELD"]]"#,
+    )
+    .await;
+
+    let abort_table_name = "trace_type_abort";
+    let abort_seed_req = make_trace_v1_request(
+        "type-abort",
+        vec![make_trace_v1_span(
+            "00000000000000000000000000000011",
+            "0000000000000011",
+            "abort-seed",
+            1_736_480_942_444_800_000,
+            1_736_480_942_444_900_000,
+            vec![make_int_attr("attr_int", 10)],
+        )],
+    );
+    let res = send_trace_v1_req(&client, abort_table_name, abort_seed_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    let abort_req = make_trace_v1_request(
+        "type-abort",
+        vec![
+            make_trace_v1_span(
+                "00000000000000000000000000000012",
+                "0000000000000012",
+                "abort-parseable",
+                1_736_480_942_445_000_000,
+                1_736_480_942_445_100_000,
+                vec![make_string_attr("attr_int", "20")],
+            ),
+            make_trace_v1_span(
+                "00000000000000000000000000000013",
+                "0000000000000013",
+                "abort-unparsable",
+                1_736_480_942_445_200_000,
+                1_736_480_942_445_300_000,
+                vec![make_string_attr("attr_int", "not_a_number")],
+            ),
+        ],
+    );
+    let res = send_trace_v1_req(&client, abort_table_name, abort_req, false).await;
+    assert_eq!(StatusCode::OK, res.status());
+    let body = ExportTraceServiceResponse::decode(res.bytes().await).unwrap();
+    let partial_success = body.partial_success.as_ref().unwrap();
+    assert_eq!(partial_success.rejected_spans, 1);
+    assert!(
+        partial_success
+            .error_message
+            .contains("Accepted 1 spans, rejected 1 spans"),
+        "unexpected partial success body: {body:?}"
+    );
+    assert!(
+        partial_success.error_message.contains(
+            "Rejected span 00000000000000000000000000000013:0000000000000013 (InvalidArguments)"
+        ),
+        "unexpected partial success body: {body:?}"
+    );
+
+    validate_data(
+        "otlp_traces_v1_type_abort_rows",
+        &client,
+        &format!(
+            "select trace_id, \"span_attributes.attr_int\" from {} order by trace_id",
+            abort_table_name
+        ),
+        r#"[["00000000000000000000000000000011",10],["00000000000000000000000000000012",20]]"#,
+    )
+    .await;
+
+    let chunk_failure_req = make_trace_v1_request(
+        "type-discard",
+        vec![
+            make_trace_v1_span(
+                "00000000000000000000000000000021",
+                "0000000000000021",
+                "discard-one",
+                1_736_480_942_445_400_000,
+                1_736_480_942_445_500_000,
+                vec![make_string_attr("attr_text", "alpha")],
+            ),
+            make_trace_v1_span(
+                "00000000000000000000000000000022",
+                "0000000000000022",
+                "discard-two",
+                1_736_480_942_445_600_000,
+                1_736_480_942_445_700_000,
+                vec![make_string_attr("attr_text", "beta")],
+            ),
+        ],
+    );
+    let res = send_trace_v1_req_with_db(
+        &client,
+        "nonexistent",
+        "trace_chunk_discard",
+        chunk_failure_req,
+        false,
+    )
+    .await;
+    assert_eq!(StatusCode::BAD_REQUEST, res.status());
+    let body = GoogleRpcStatus::decode(res.bytes().await.as_ref()).unwrap();
+    assert!(
+        body.message.contains("Accepted 0 spans, rejected 2 spans"),
+        "unexpected error body: {body:?}"
+    );
+    assert!(
+        body.message.contains("Chunk fallback triggered by")
+            || body
+                .message
+                .contains("Discarded 2 spans after ambiguous chunk failure"),
+        "unexpected error body: {body:?}"
+    );
 
     guard.remove_all().await;
 }
@@ -7506,6 +8300,129 @@ async fn send_req(
     }
 
     req.header("content-length", len).send().await
+}
+
+async fn send_trace_v1_req(
+    client: &TestClient,
+    table_name: &str,
+    req: ExportTraceServiceRequest,
+    with_gzip: bool,
+) -> TestResponse {
+    send_trace_v1_req_with_db(client, "public", table_name, req, with_gzip).await
+}
+
+async fn send_trace_v1_req_with_db(
+    client: &TestClient,
+    db_name: &str,
+    table_name: &str,
+    req: ExportTraceServiceRequest,
+    with_gzip: bool,
+) -> TestResponse {
+    send_req(
+        client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static(GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME),
+            ),
+            (
+                HeaderName::from_static("x-greptime-trace-table-name"),
+                HeaderValue::from_str(table_name).unwrap(),
+            ),
+            (
+                GREPTIME_DB_HEADER_NAME.clone(),
+                HeaderValue::from_str(db_name).unwrap(),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        req.encode_to_vec(),
+        with_gzip,
+    )
+    .await
+}
+
+fn make_trace_v1_request(service_name: &str, spans: Vec<Value>) -> ExportTraceServiceRequest {
+    serde_json::from_value(json!({
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [{
+                    "key": "service.name",
+                    "value": { "stringValue": service_name }
+                }]
+            },
+            "scopeSpans": [{
+                "scope": {
+                    "name": "trace-v1-type-tests"
+                },
+                "spans": spans
+            }],
+            "schemaUrl": "https://opentelemetry.io/schemas/1.4.0"
+        }]
+    }))
+    .unwrap()
+}
+
+fn make_trace_v1_span(
+    trace_id: &str,
+    span_id: &str,
+    name: &str,
+    start_time_unix_nano: i64,
+    end_time_unix_nano: i64,
+    attributes: Vec<Value>,
+) -> Value {
+    json!({
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": 2,
+        "startTimeUnixNano": start_time_unix_nano.to_string(),
+        "endTimeUnixNano": end_time_unix_nano.to_string(),
+        "attributes": attributes,
+        "status": {
+            "message": "",
+            "code": 0
+        }
+    })
+}
+
+fn make_string_attr(key: &str, value: &str) -> Value {
+    json!({
+        "key": key,
+        "value": {
+            "stringValue": value
+        }
+    })
+}
+
+fn make_int_attr(key: &str, value: i64) -> Value {
+    json!({
+        "key": key,
+        "value": {
+            "intValue": value.to_string()
+        }
+    })
+}
+
+fn make_double_attr(key: &str, value: f64) -> Value {
+    json!({
+        "key": key,
+        "value": {
+            "doubleValue": value
+        }
+    })
+}
+
+fn make_bool_attr(key: &str, value: bool) -> Value {
+    json!({
+        "key": key,
+        "value": {
+            "boolValue": value
+        }
+    })
 }
 
 fn get_rows_from_output(output: &str) -> String {

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -75,6 +75,7 @@ use crate::http::result::null_result::NullResponse;
 use crate::interceptor::LogIngestInterceptorRef;
 use crate::metrics::http_metrics_layer;
 use crate::metrics_handler::MetricsHandler;
+use crate::pending_rows_batcher::PendingRowsBatcher;
 use crate::prometheus_handler::PrometheusHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
@@ -128,7 +129,8 @@ const DEFAULT_BODY_LIMIT: ReadableSize = ReadableSize::mb(64);
 pub const AUTHORIZATION_HEADER: &str = "x-greptime-auth";
 
 // TODO(fys): This is a temporary workaround, it will be improved later
-pub static PUBLIC_APIS: [&str; 3] = ["/v1/influxdb/ping", "/v1/influxdb/health", "/v1/health"];
+pub static PUBLIC_API_PREFIX: [&str; 3] =
+    ["/v1/influxdb/ping", "/v1/influxdb/health", "/v1/health"];
 
 #[derive(Default)]
 pub struct HttpServer {
@@ -585,12 +587,14 @@ impl HttpServerBuilder {
         pipeline_handler: Option<PipelineHandlerRef>,
         prom_store_with_metric_engine: bool,
         prom_validation_mode: PromValidationMode,
+        pending_rows_batcher: Option<Arc<PendingRowsBatcher>>,
     ) -> Self {
         let state = PromStoreState {
             prom_store_handler: handler,
             pipeline_handler,
             prom_store_with_metric_engine,
             prom_validation_mode,
+            pending_rows_batcher,
         };
 
         Self {
@@ -761,6 +765,7 @@ impl HttpServer {
         };
 
         router = router
+            .route("/", routing::get(handler::index))
             .route(
                 "/health",
                 routing::get(handler::health).post(handler::health),
@@ -1309,7 +1314,7 @@ mod test {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use arrow_ipc::reader::FileReader;
+    use arrow_ipc::reader::StreamReader;
     use arrow_schema::DataType;
     use axum::handler::Handler;
     use axum::http::StatusCode;
@@ -1349,8 +1354,8 @@ mod test {
 
         async fn do_exec_plan(
             &self,
-            _stmt: Option<Statement>,
             _plan: LogicalPlan,
+            _stmt: Option<Statement>,
             _query_ctx: QueryContextRef,
         ) -> Result<Output> {
             unimplemented!()
@@ -1681,8 +1686,8 @@ mod test {
 
                 HttpResponse::Arrow(resp) => {
                     let output = resp.data;
-                    let mut reader =
-                        FileReader::try_new(Cursor::new(output), None).expect("Arrow reader error");
+                    let mut reader = StreamReader::try_new(Cursor::new(output), None)
+                        .expect("Arrow reader error");
                     let schema = reader.schema();
                     assert_eq!(schema.fields[0].name(), "numbers");
                     assert_eq!(schema.fields[0].data_type(), &DataType::UInt32);

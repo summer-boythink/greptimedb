@@ -207,6 +207,7 @@ impl WorkerGroup {
                 .vector_cache_size(config.vector_cache_size.as_bytes())
                 .page_cache_size(config.page_cache_size.as_bytes())
                 .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
+                .range_result_cache_size(config.range_result_cache_size.as_bytes())
                 .index_metadata_size(config.index.metadata_cache_size.as_bytes())
                 .index_content_size(config.index.content_cache_size.as_bytes())
                 .index_content_page_size(config.index.content_cache_page_size.as_bytes())
@@ -421,6 +422,7 @@ impl WorkerGroup {
                 .vector_cache_size(config.vector_cache_size.as_bytes())
                 .page_cache_size(config.page_cache_size.as_bytes())
                 .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
+                .range_result_cache_size(config.range_result_cache_size.as_bytes())
                 .write_cache(write_cache)
                 .build(),
         );
@@ -1193,6 +1195,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
             BackgroundNotify::CompactionFinished(req) => {
                 self.handle_compaction_finished(region_id, req).await
+            }
+            BackgroundNotify::CompactionCancelled(req) => {
+                self.handle_compaction_cancelled(region_id, req).await
             }
             BackgroundNotify::CompactionFailed(req) => self.handle_compaction_failure(req).await,
             BackgroundNotify::Truncate(req) => self.handle_truncate_result(req).await,

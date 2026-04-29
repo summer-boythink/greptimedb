@@ -273,6 +273,14 @@ impl SyncRegion {
                 }
                 Ok(())
             }
+            Err(error::Error::MailboxChannelClosed { .. }) => error::RetryLaterSnafu {
+                reason: format!(
+                    "Mailbox closed when sending sync region to datanode {:?}, elapsed: {:?}",
+                    peer,
+                    now.elapsed()
+                ),
+            }
+            .fail()?,
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
                     "Mailbox received timeout for sync regions on datanode {:?}, elapsed: {:?}",
@@ -338,7 +346,7 @@ impl SyncRegion {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
 
     use common_meta::peer::Peer;
     use common_meta::rpc::router::{Region, RegionRoute};

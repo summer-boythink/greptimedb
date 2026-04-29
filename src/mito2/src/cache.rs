@@ -28,6 +28,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use common_base::readable_size::ReadableSize;
 use common_telemetry::warn;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::value::Value;
@@ -49,7 +50,7 @@ use crate::cache::index::inverted_index::{InvertedIndexCache, InvertedIndexCache
 #[cfg(feature = "vector_index")]
 use crate::cache::index::vector_index::{VectorIndexCache, VectorIndexCacheRef};
 use crate::cache::write_cache::WriteCacheRef;
-use crate::error::{InvalidMetadataSnafu, InvalidParquetSnafu, Result};
+use crate::error::{InvalidMetadataSnafu, InvalidParquetSnafu, Result, UnexpectedSnafu};
 use crate::memtable::record_batch_estimated_size;
 use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
@@ -72,6 +73,70 @@ const INDEX_TYPE: &str = "index";
 const SELECTOR_RESULT_TYPE: &str = "selector_result";
 /// Metrics type key for range scan result cache.
 const RANGE_RESULT_TYPE: &str = "range_result";
+const RANGE_RESULT_CONCAT_MEMORY_LIMIT: ReadableSize = ReadableSize::mb(512);
+const RANGE_RESULT_CONCAT_MEMORY_PERMIT: ReadableSize = ReadableSize::kb(1);
+
+#[derive(Debug)]
+pub(crate) struct RangeResultMemoryLimiter {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permit_bytes: usize,
+    total_permits: usize,
+}
+
+impl Default for RangeResultMemoryLimiter {
+    fn default() -> Self {
+        Self::new(
+            RANGE_RESULT_CONCAT_MEMORY_LIMIT.as_bytes() as usize,
+            RANGE_RESULT_CONCAT_MEMORY_PERMIT.as_bytes() as usize,
+        )
+    }
+}
+
+impl RangeResultMemoryLimiter {
+    pub(crate) fn new(limit_bytes: usize, permit_bytes: usize) -> Self {
+        let permit_bytes = permit_bytes.max(1);
+        let total_permits = limit_bytes
+            .div_ceil(permit_bytes)
+            .clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(total_permits)),
+            permit_bytes,
+            total_permits,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn permit_bytes(&self) -> usize {
+        self.permit_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    pub(crate) async fn acquire(&self, bytes: usize) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let permits = bytes.div_ceil(self.permit_bytes).max(1);
+        if permits > self.total_permits {
+            return UnexpectedSnafu {
+                reason: format!(
+                    "range result memory request of {bytes} bytes exceeds limiter capacity of {} bytes",
+                    self.total_permits.saturating_mul(self.permit_bytes)
+                ),
+            }
+            .fail();
+        }
+        self.semaphore
+            .acquire_many(permits as u32)
+            .await
+            .map_err(|_| {
+                UnexpectedSnafu {
+                    reason: "range result memory limiter is unexpectedly closed",
+                }
+                .build()
+            })
+    }
+}
 
 /// Cached SST metadata combines the parquet footer with the decoded region metadata.
 ///
@@ -350,7 +415,7 @@ impl CacheStrategy {
 
     /// Calls [CacheManager::get_range_result()].
     /// It returns None if the strategy is [CacheStrategy::Compaction] or [CacheStrategy::Disabled].
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn get_range_result(
         &self,
         key: &RangeScanCacheKey,
@@ -363,7 +428,6 @@ impl CacheStrategy {
 
     /// Calls [CacheManager::put_range_result()].
     /// It does nothing if the strategy isn't [CacheStrategy::EnableAll].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn put_range_result(
         &self,
         key: RangeScanCacheKey,
@@ -371,6 +435,32 @@ impl CacheStrategy {
     ) {
         if let CacheStrategy::EnableAll(cache_manager) = self {
             cache_manager.put_range_result(key, result);
+        }
+    }
+
+    /// Returns true if the range result cache is enabled.
+    pub(crate) fn has_range_result_cache(&self) -> bool {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) => cache_manager.has_range_result_cache(),
+            CacheStrategy::Compaction(_) | CacheStrategy::Disabled => false,
+        }
+    }
+
+    pub(crate) fn range_result_memory_limiter(&self) -> Option<&Arc<RangeResultMemoryLimiter>> {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) => {
+                Some(cache_manager.range_result_memory_limiter())
+            }
+            CacheStrategy::Compaction(_) | CacheStrategy::Disabled => None,
+        }
+    }
+
+    pub(crate) fn range_result_cache_size(&self) -> Option<usize> {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) => {
+                Some(cache_manager.range_result_cache_size())
+            }
+            CacheStrategy::Compaction(_) | CacheStrategy::Disabled => None,
         }
     }
 
@@ -476,8 +566,11 @@ pub struct CacheManager {
     /// Cache for time series selectors.
     selector_result_cache: Option<SelectorResultCache>,
     /// Cache for range scan outputs in flat format.
-    #[cfg_attr(not(test), allow(dead_code))]
     range_result_cache: Option<RangeResultCache>,
+    /// Configured capacity for range scan outputs in flat format.
+    range_result_cache_size: u64,
+    /// Shared memory limiter for async range-result cache tasks.
+    range_result_memory_limiter: Arc<RangeResultMemoryLimiter>,
     /// Cache for index result.
     index_result_cache: Option<IndexResultCache>,
 }
@@ -713,7 +806,7 @@ impl CacheManager {
     }
 
     /// Gets cached result for range scan.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn get_range_result(
         &self,
         key: &RangeScanCacheKey,
@@ -723,8 +816,7 @@ impl CacheManager {
             .and_then(|cache| update_hit_miss(cache.get(key), RANGE_RESULT_TYPE))
     }
 
-    /// Puts range scan result into the cache.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Puts range scan result into cache.
     pub(crate) fn put_range_result(
         &self,
         key: RangeScanCacheKey,
@@ -736,6 +828,19 @@ impl CacheManager {
                 .add(range_result_cache_weight(&key, &result).into());
             cache.insert(key, result);
         }
+    }
+
+    /// Returns true if the range result cache is enabled.
+    pub(crate) fn has_range_result_cache(&self) -> bool {
+        self.range_result_cache.is_some()
+    }
+
+    pub(crate) fn range_result_memory_limiter(&self) -> &Arc<RangeResultMemoryLimiter> {
+        &self.range_result_memory_limiter
+    }
+
+    pub(crate) fn range_result_cache_size(&self) -> usize {
+        self.range_result_cache_size as usize
     }
 
     /// Gets the write cache.
@@ -949,7 +1054,7 @@ impl CacheManagerBuilder {
             Cache::builder()
                 .max_capacity(self.range_result_cache_size)
                 .weigher(range_result_cache_weight)
-                .eviction_listener(|k, v, cause| {
+                .eviction_listener(move |k, v, cause| {
                     let size = range_result_cache_weight(&k, &v);
                     CACHE_BYTES
                         .with_label_values(&[RANGE_RESULT_TYPE])
@@ -972,6 +1077,11 @@ impl CacheManagerBuilder {
             puffin_metadata_cache: Some(Arc::new(puffin_metadata_cache)),
             selector_result_cache,
             range_result_cache,
+            range_result_cache_size: self.range_result_cache_size,
+            range_result_memory_limiter: Arc::new(RangeResultMemoryLimiter::new(
+                self.range_result_cache_size as usize,
+                RANGE_RESULT_CONCAT_MEMORY_PERMIT.as_bytes() as usize,
+            )),
             index_result_cache,
         }
     }
@@ -1361,7 +1471,7 @@ mod tests {
             }
             .build(),
         };
-        let value = Arc::new(RangeScanCacheValue::new(Vec::new()));
+        let value = Arc::new(RangeScanCacheValue::new(Vec::new(), 0));
 
         assert!(cache.get_range_result(&key).is_none());
         cache.put_range_result(key.clone(), value.clone());
@@ -1379,6 +1489,46 @@ mod tests {
         assert!(disabled.get_range_result(&key).is_none());
         disabled.put_range_result(key.clone(), value);
         assert!(cache.get_range_result(&key).is_some());
+    }
+
+    #[test]
+    fn test_range_result_cache_size_configures_limiter() {
+        let cache_size = 3 * 1024_u64;
+        let cache = CacheManager::builder()
+            .range_result_cache_size(cache_size)
+            .build();
+
+        assert_eq!(cache.range_result_cache_size(), cache_size as usize);
+        assert_eq!(
+            cache.range_result_memory_limiter().permit_bytes(),
+            RANGE_RESULT_CONCAT_MEMORY_PERMIT.as_bytes() as usize
+        );
+        assert_eq!(
+            cache.range_result_memory_limiter().available_permits(),
+            (cache_size as usize).div_ceil(RANGE_RESULT_CONCAT_MEMORY_PERMIT.as_bytes() as usize)
+        );
+    }
+
+    #[tokio::test]
+    async fn range_result_memory_limiter_rejects_oversized_request() {
+        let limiter = RangeResultMemoryLimiter::new(2 * 1024, 1024);
+        assert_eq!(limiter.available_permits(), 2);
+
+        let err = limiter.acquire(10 * 1024).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds limiter capacity"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(limiter.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn range_result_memory_limiter_allows_request_up_to_capacity() {
+        let limiter = RangeResultMemoryLimiter::new(2 * 1024, 1024);
+        let permit = limiter.acquire(2 * 1024).await.unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+        drop(permit);
+        assert_eq!(limiter.available_permits(), 2);
     }
 
     #[tokio::test]

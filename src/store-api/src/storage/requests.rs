@@ -21,7 +21,7 @@ use datafusion_expr::expr::Expr;
 pub use datatypes::schema::{VectorDistanceMetric, VectorIndexEngineType};
 use strum::Display;
 
-use crate::storage::{ColumnId, SequenceNumber};
+use crate::storage::{ColumnId, ProjectionInput, SequenceNumber};
 
 /// A hint for KNN vector search.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,9 +95,9 @@ pub enum TimeSeriesDistribution {
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ScanRequest {
-    /// Indices of columns to read, `None` to read all columns. This indices is
-    /// based on table schema.
-    pub projection: Option<Vec<usize>>,
+    /// Optional projection information for the scan. `None` reads all root
+    /// columns.
+    pub projection_input: Option<ProjectionInput>,
     /// Filters pushed down
     pub filters: Vec<Expr>,
     /// Expected output ordering. This is only a hint and isn't guaranteed.
@@ -112,6 +112,8 @@ pub struct ScanRequest {
     /// Optional constraint on the sequence number of the rows to read.
     /// If set, only rows with a sequence number **lesser or equal** to this value
     /// will be returned.
+    /// This is the effective memtable upper bound used by the scan, whether provided
+    /// explicitly or bound on scan open.
     pub memtable_max_sequence: Option<SequenceNumber>,
     /// Optional constraint on the minimal sequence number in the memtable.
     /// If set, only the memtables that contain sequences **greater than** this value will be scanned
@@ -119,13 +121,22 @@ pub struct ScanRequest {
     /// Optional constraint on the minimal sequence number in the SST files.
     /// If set, only the SST files that contain sequences greater than this value will be scanned.
     pub sst_min_sequence: Option<SequenceNumber>,
+    /// Whether to bind the effective snapshot upper bound when opening the scan.
+    pub snapshot_on_scan: bool,
     /// Optional hint for the distribution of time-series data.
     pub distribution: Option<TimeSeriesDistribution>,
     /// Optional hint for KNN vector search. When set, the scan should use
     /// vector index to find the k nearest neighbors.
     pub vector_search: Option<VectorSearchRequest>,
-    /// Whether to force reading region data in flat format.
-    pub force_flat_format: bool,
+}
+
+impl ScanRequest {
+    /// Returns the top-level projected column indices.
+    pub fn projection_indices(&self) -> Option<&[usize]> {
+        self.projection_input
+            .as_ref()
+            .map(|projection_input| projection_input.projection.as_slice())
+    }
 }
 
 impl Display for ScanRequest {
@@ -150,7 +161,7 @@ impl Display for ScanRequest {
         let mut delimiter = Delimiter::None;
 
         write!(f, "ScanRequest {{ ")?;
-        if let Some(projection) = &self.projection {
+        if let Some(projection) = &self.projection_input {
             write!(f, "{}projection: {:?}", delimiter.as_str(), projection)?;
         }
         if !self.filters.is_empty() {
@@ -195,6 +206,14 @@ impl Display for ScanRequest {
                 sst_min_sequence
             )?;
         }
+        if self.snapshot_on_scan {
+            write!(
+                f,
+                "{}snapshot_on_scan: {}",
+                delimiter.as_str(),
+                self.snapshot_on_scan
+            )?;
+        }
         if let Some(distribution) = &self.distribution {
             write!(f, "{}distribution: {}", delimiter.as_str(), distribution)?;
         }
@@ -206,14 +225,6 @@ impl Display for ScanRequest {
                 vector_search.column_id,
                 vector_search.k,
                 vector_search.metric
-            )?;
-        }
-        if self.force_flat_format {
-            write!(
-                f,
-                "{}force_flat_format: {}",
-                delimiter.as_str(),
-                self.force_flat_format
             )?;
         }
         write!(f, " }}")
@@ -233,8 +244,9 @@ mod tests {
         };
         assert_eq!(request.to_string(), "ScanRequest {  }");
 
+        let projection_input = Some(vec![1, 2].into());
         let request = ScanRequest {
-            projection: Some(vec![1, 2]),
+            projection_input,
             filters: vec![
                 binary_expr(col("i"), Operator::Gt, lit(1)),
                 binary_expr(col("s"), Operator::Eq, lit("x")),
@@ -244,7 +256,7 @@ mod tests {
         };
         assert_eq!(
             request.to_string(),
-            r#"ScanRequest { projection: [1, 2], filters: [i > Int32(1), s = Utf8("x")], limit: 10 }"#
+            r#"ScanRequest { projection: ProjectionInput { projection: [1, 2], nested_paths: [] }, filters: [i > Int32(1), s = Utf8("x")], limit: 10 }"#
         );
 
         let request = ScanRequest {
@@ -260,23 +272,38 @@ mod tests {
             r#"ScanRequest { filters: [i > Int32(1), s = Utf8("x")], limit: 10 }"#
         );
 
+        let projection_input = Some(vec![1, 2].into());
         let request = ScanRequest {
-            projection: Some(vec![1, 2]),
+            projection_input,
             limit: Some(10),
             ..Default::default()
         };
         assert_eq!(
             request.to_string(),
-            "ScanRequest { projection: [1, 2], limit: 10 }"
+            "ScanRequest { projection: ProjectionInput { projection: [1, 2], nested_paths: [] }, limit: 10 }"
         );
 
+        let projection_input = Some(ProjectionInput::new(vec![1, 2]).with_nested_paths(vec![
+            vec!["j".to_string(), "a".to_string(), "b".to_string()],
+            vec!["s".to_string(), "x".to_string()],
+        ]));
         let request = ScanRequest {
-            force_flat_format: true,
+            projection_input,
+            limit: Some(10),
             ..Default::default()
         };
         assert_eq!(
             request.to_string(),
-            "ScanRequest { force_flat_format: true }"
+            r#"ScanRequest { projection: ProjectionInput { projection: [1, 2], nested_paths: [["j", "a", "b"], ["s", "x"]] }, limit: 10 }"#
+        );
+
+        let request = ScanRequest {
+            snapshot_on_scan: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            request.to_string(),
+            "ScanRequest { snapshot_on_scan: true }"
         );
     }
 }
